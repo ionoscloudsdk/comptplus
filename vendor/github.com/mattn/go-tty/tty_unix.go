@@ -1,5 +1,5 @@
-// +build !windows
-// +build !plan9
+//go:build !windows && !plan9
+// +build !windows,!plan9
 
 package tty
 
@@ -7,8 +7,9 @@ import (
 	"bufio"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,7 +18,7 @@ type TTY struct {
 	in      *os.File
 	bin     *bufio.Reader
 	out     *os.File
-	termios syscall.Termios
+	termios unix.Termios
 	ss      chan os.Signal
 }
 
@@ -31,19 +32,23 @@ func open(path string) (*TTY, error) {
 	tty.in = in
 	tty.bin = bufio.NewReader(in)
 
-	out, err := os.OpenFile(path, syscall.O_WRONLY, 0)
+	out, err := os.OpenFile(path, unix.O_WRONLY, 0)
 	if err != nil {
 		return nil, err
 	}
 	tty.out = out
 
-	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(tty.in.Fd()), ioctlReadTermios, uintptr(unsafe.Pointer(&tty.termios))); err != 0 {
+	termios, err := unix.IoctlGetTermios(int(tty.in.Fd()), ioctlReadTermios)
+	if err != nil {
 		return nil, err
 	}
-	newios := tty.termios
-	newios.Iflag &^= syscall.ISTRIP | syscall.INLCR | syscall.ICRNL | syscall.IGNCR | syscall.IXOFF
-	newios.Lflag &^= syscall.ECHO | syscall.ICANON /*| syscall.ISIG*/
-	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(tty.in.Fd()), ioctlWriteTermios, uintptr(unsafe.Pointer(&newios))); err != 0 {
+	tty.termios = *termios
+
+	termios.Iflag &^= unix.ISTRIP | unix.INLCR | unix.ICRNL | unix.IGNCR | unix.IXOFF
+	termios.Lflag &^= unix.ECHO | unix.ICANON /*| unix.ISIG*/
+	termios.Cc[unix.VMIN] = 1
+	termios.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(int(tty.in.Fd()), ioctlWriteTermios, termios); err != nil {
 		return nil, err
 	}
 
@@ -62,10 +67,25 @@ func (tty *TTY) readRune() (rune, error) {
 }
 
 func (tty *TTY) close() error {
+	if tty.out == nil || tty.in == nil {
+		return nil
+	}
+
 	signal.Stop(tty.ss)
 	close(tty.ss)
-	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(tty.in.Fd()), ioctlWriteTermios, uintptr(unsafe.Pointer(&tty.termios)))
-	return err
+	err1 := unix.IoctlSetTermios(int(tty.in.Fd()), ioctlWriteTermios, &tty.termios)
+	err2 := tty.out.Close()
+	err3 := tty.in.Close()
+
+	tty.out = nil
+	tty.in = nil
+	if err1 != nil {
+		return err1
+	}
+	if err2 != nil {
+		return err2
+	}
+	return err3
 }
 
 func (tty *TTY) size() (int, int, error) {
@@ -74,11 +94,75 @@ func (tty *TTY) size() (int, int, error) {
 }
 
 func (tty *TTY) sizePixel() (int, int, int, int, error) {
-	var dim [4]uint16
-	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(tty.out.Fd()), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&dim))); err != 0 {
+	ws, err := unix.IoctlGetWinsize(int(tty.out.Fd()), unix.TIOCGWINSZ)
+	if err != nil {
 		return -1, -1, -1, -1, err
 	}
-	return int(dim[1]), int(dim[0]), int(dim[2]), int(dim[3]), nil
+	xpixel, ypixel := int(ws.Xpixel), int(ws.Ypixel)
+	if xpixel == 0 || ypixel == 0 {
+		if xp, yp := tty.queryPixelSize(); xp > 0 && yp > 0 {
+			xpixel, ypixel = xp, yp
+		}
+	}
+	return int(ws.Col), int(ws.Row), xpixel, ypixel, nil
+}
+
+// queryPixelSize sends the xterm "report window size in pixels" sequence
+// (\x1b[14t) and parses the response (\x1b[4;height;widtht).
+func (tty *TTY) queryPixelSize() (xpixel, ypixel int) {
+	fd := int(tty.in.Fd())
+
+	// Temporarily set VMIN=0, VTIME=1 (100ms timeout) so the read
+	// returns promptly if the terminal does not respond.
+	termios, err := unix.IoctlGetTermios(fd, ioctlReadTermios)
+	if err != nil {
+		return 0, 0
+	}
+	backup := *termios
+	termios.Cc[unix.VMIN] = 0
+	termios.Cc[unix.VTIME] = 1
+	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, termios); err != nil {
+		return 0, 0
+	}
+	defer unix.IoctlSetTermios(fd, ioctlWriteTermios, &backup)
+
+	tty.out.WriteString("\x1b[14t")
+
+	// Read response byte by byte until 't' or timeout.
+	var buf [1]byte
+	var resp []byte
+	for {
+		n, _ := tty.in.Read(buf[:])
+		if n == 0 {
+			break
+		}
+		resp = append(resp, buf[0])
+		if buf[0] == 't' {
+			break
+		}
+	}
+
+	// Parse \x1b[4;height;widtht
+	s := string(resp)
+	idx := strings.Index(s, "[4;")
+	if idx < 0 {
+		return 0, 0
+	}
+	s = s[idx+3:]
+	tidx := strings.IndexByte(s, 't')
+	if tidx < 0 {
+		return 0, 0
+	}
+	parts := strings.SplitN(s[:tidx], ";", 2)
+	if len(parts) != 2 {
+		return 0, 0
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	w, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || h <= 0 || w <= 0 {
+		return 0, 0
+	}
+	return w, h
 }
 
 func (tty *TTY) input() *os.File {
@@ -103,7 +187,10 @@ func (tty *TTY) raw() (func() error, error) {
 	termios.Cflag |= unix.CS8
 	termios.Cc[unix.VMIN] = 1
 	termios.Cc[unix.VTIME] = 0
-	if err := unix.IoctlSetTermios(int(tty.in.Fd()), ioctlWriteTermios, termios); err != nil {
+	if err = unix.IoctlSetTermios(int(tty.in.Fd()), ioctlWriteTermios, termios); err != nil {
+		return nil, err
+	}
+	if err = syscall.SetNonblock(int(tty.in.Fd()), true); err != nil {
 		return nil, err
 	}
 
@@ -116,13 +203,13 @@ func (tty *TTY) raw() (func() error, error) {
 }
 
 func (tty *TTY) sigwinch() <-chan WINSIZE {
-	signal.Notify(tty.ss, syscall.SIGWINCH)
+	signal.Notify(tty.ss, unix.SIGWINCH)
 
 	ws := make(chan WINSIZE)
 	go func() {
 		defer close(ws)
 		for sig := range tty.ss {
-			if sig != syscall.SIGWINCH {
+			if sig != unix.SIGWINCH {
 				continue
 			}
 

@@ -72,7 +72,7 @@ func TestFindSuggestions(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			buf := prompt.NewBuffer()
-			buf.InsertText(test.input, true)
+			buf.InsertTextMoveCursor(test.input, 999, 999, false)
 			suggestions, _, _ := cp.findSuggestions(*buf.Document())
 
 			assert.Len(t, suggestions, len(test.expectedResults), "Incorrect number of suggestions")
